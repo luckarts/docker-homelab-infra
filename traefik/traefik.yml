@@ -1,0 +1,67 @@
+log:
+  level: DEBUG
+
+accessLog: {}
+
+api:
+  dashboard: false
+
+entryPoints:
+  web: # 👉 Port 80 (HTTP)
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure #   → redirige TOUT le traffic vers HTTPS
+          scheme: https
+          permanent: true #   301 (permanent, les navigateurs s'en souviennent)
+
+  websecure: # 👉 Port 443 (HTTPS)
+    address: ":443" #   → c'est ici que tes services vivent
+
+  metrics: # 👉 Port 8082 (métriques Prometheus)
+    address: ":8082" #   → pas de routeur public dessus
+
+# ── PROVIDER DOCKER ───────────────────────────────────────────────────────────
+# Comment Traefik découvre les services automatiquement.
+# Il surveille le socket Docker et inspecte les labels des conteneurs.
+providers:
+  docker:
+    exposedByDefault:
+      false # 🔐 SÉCURITÉ : aucun service exposé par défaut
+      #   Chaque service doit mettre traefik.enable=true
+    network:
+      traefik-web # 🔭 Traefik ne voit QUE les conteneurs sur ce réseau
+      #   Si un conteneur est ailleurs, pas de route possible
+
+# ── MÉTRIQUES PROMETHEUS ──────────────────────────────────────────────────────
+# Expose les métriques de Traefik (requêtes, temps de réponse, statuts…)
+# Scrapé par Prometheus sur le port :8082 (entrypoint metrics)
+metrics:
+  prometheus:
+    addEntryPointsLabels: true # Ajoute le nom de l'entrypoint aux métriques
+    addServicesLabels: true # Ajoute le nom du service aux métriques
+    entryPoint: metrics # Point d'accès = entrypoint metrics
+
+http:
+  middlewares:
+    redirect-to-https:
+      redirectScheme:
+        scheme: https
+        permanent: true
+
+# ── CERTIFICATS LET'S ENCRYPT ─────────────────────────────────────────────────
+# Générateur de certificats TLS automatique et gratuit.
+# Renouvellement automatique tous les 90 jours.
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@bachelart.fr # 📧 Email pour les notifications d'expiration
+      storage:
+        /acme.json # 💾 Stockage des clés privées et certificats
+        #   ⚠️ chmod 600 obligatoire (sécurité)
+        #   ⚠️ PAS de :ro dans le mount Docker
+      httpChallenge:
+        entryPoint:
+          web # Let's Encrypt vérifie via le port 80
+          #   (il fait une requête HTTP sur le domaine à certifier)

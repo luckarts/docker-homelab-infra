@@ -1,0 +1,71 @@
+# =============================================================================
+# docker-compose.yml — Traefik v3 (reverse proxy)
+# =============================================================================
+# Point d'entrée unique pour tout le trafic HTTP(S) vers les conteneurs.
+# Découverte automatique des services via le socket Docker.
+# Certificats Let's Encrypt automatiques.
+#
+# Pièges :
+#   - acme.json doit être chmod 600 avant le premier démarrage
+#   - Les routeurs Traefik doivent avoir des noms uniques (suffixer par -prod / -staging)
+#   - exposedByDefault: false => chaque service doit mettre traefik.enable=true
+# =============================================================================
+
+services:
+  # ==========================================================================
+  # SERVICE : traefik
+  # --------------------------------------------------------------------------
+  #   - Entrypoints HTTP (80) → redirection HTTPS, HTTPS (443), Metrics (8082)
+  #   - Provider Docker : surveillance du socket Docker
+  #   - Certificats Let's Encrypt automatiques
+  #   - Métriques Prometheus scrapées sur :8082
+  # ==========================================================================
+  traefik:
+    image: traefik:v3.3
+    container_name: traefik
+    restart: unless-stopped
+
+    # ── Ports ─────────────────────────────────────────────────────────────
+    # - 80 : HTTP → redirection 301 vers HTTPS (configuré dans traefik.yml)
+    # - 443 : HTTPS (terminaison TLS)
+    # - 8082 : Métriques Prometheus (pas de routeur public, réservé au monitoring)
+    ports:
+      - "80:80"       # HTTP → redirection HTTPS
+      - "443:443"     # HTTPS
+      - "8082:8082"   # Métriques Prometheus
+
+    # ── Volumes ───────────────────────────────────────────────────────────
+    # /var/run/docker.sock : socket Docker (lecture seule) → découverte des services
+    # ./traefik.yml       : configuration statique (lecture seule)
+    # ./acme.json         : certificats TLS (sans :ro — Traefik doit écrire)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/traefik.yml:ro
+      - ./acme.json:/acme.json
+
+    # ── Réseaux ──────────────────────────────────────────────────────────
+    # - traefik-web : réseau public partagé avec toutes les apps routées
+    # - monitoring-network : réseau dédié à l'observabilité (Prometheus scrape)
+    networks:
+      - traefik-web
+      - monitoring-network
+
+    # ── Labels ────────────────────────────────────────────────────────────
+    # Traefik ne se route pas lui-même (ce serait un loop infini).
+    # Les métriques Prometheus sont exposées sur le port 8082 sans routeur HTTP.
+    labels:
+      - "traefik.enable=false"  # Traefik ne se route pas lui-même
+
+# =============================================================================
+# RÉSEAUX
+# -----------------------------------------------------------------------------
+# Tous les réseaux sont déclarés external: true — ils sont créés une fois par
+# `deploy.sh networks` et partagés entre tous les projets du VPS.
+# =============================================================================
+networks:
+  traefik-web:
+    external: true
+    name: traefik-web
+  monitoring-network:
+    external: true
+    name: monitoring-network

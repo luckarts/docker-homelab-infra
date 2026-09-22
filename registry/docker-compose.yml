@@ -1,0 +1,88 @@
+# =============================================================================
+# docker-compose.yml — Registry Docker privé
+# =============================================================================
+# Stocke et sert les images Docker du projet, accessible uniquement via
+# Traefik (HTTPS). Authentification htpasswd (bcrypt) obligatoire.
+#
+# Particularités :
+#   - Aucun port publié → routage 100% Traefik (label traefik)
+#   - Auth htpasswd monté en read-only
+#   - Données persistées dans un volume nommé (registry_data)
+#   - Réseau traefik-web partagé pour l'accès via le reverse proxy
+#
+# Pièges :
+#   - Le registry n'est accessible QUE si Traefik tourne (pas de port direct)
+#   - htpasswd doit être généré avec bcrypt : `htpasswd -nbB user pass`
+#   - Le volume registry_data est persistant — sa perte = perte des images
+# =============================================================================
+
+services:
+  # ==========================================================================
+  # SERVICE : registry
+  # --------------------------------------------------------------------------
+  #   - Image officielle registry:2
+  #   - Auth htpasswd (bcrypt) monté en read-only
+  #   - Données persistées dans un volume nommé
+  #   - Routé via Traefik (label traefik.enable=true) — aucun port exposé
+  #   - Un seul réseau : traefik-web (accessible depuis le reverse proxy)
+  # ==========================================================================
+  registry:
+    image: registry:2
+    container_name: registry
+    restart: unless-stopped
+
+    # ── Ports ─────────────────────────────────────────────────────────────
+    #
+    # Aucun port publié — le registry est accessible uniquement via le
+    # réseau traefik-web, routé par Traefik en HTTPS. L'accès direct au
+    # port 5000 n'existe pas en dehors du réseau Docker.
+
+    # ── Volumes ───────────────────────────────────────────────────────────
+    # ./data       : stockage persistant des images Docker (registry_data)
+    # ./htpasswd   : fichier d'authentification htpasswd (généré avec bcrypt)
+    volumes:
+      - ./data:/var/lib/registry
+      - ./htpasswd:/auth/htpasswd:ro
+
+    # ── Variables d'environnement ─────────────────────────────────────────
+    environment:
+      APP_ENV: ${ENV:?ENV is required}                        # staging ou prod
+      APP_DOMAIN: ${FRONTEND_HOST:?FRONTEND_HOST is required} # domaine du service
+      LOG_LEVEL: info
+      REGISTRY_HTTP_ADDR: 0.0.0.0:5000
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry Realm
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+
+    # ── Réseaux ──────────────────────────────────────────────────────────
+    # - traefik-web : réseau public partagé avec toutes les apps routées
+    # - monitoring-network : réseau dédié à l'observabilité (Prometheus scrape)
+    networks:
+      - traefik-web
+
+    # ── Labels ────────────────────────────────────────────────────────────
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.registry.rule=Host(`registry.bachelart.fr`)"
+      - "traefik.http.routers.registry.entrypoints=websecure"
+      - "traefik.http.routers.registry.tls.certresolver=letsencrypt"
+      - "traefik.http.services.registry.loadbalancer.server.port=5000"
+      - "traefik.http.middlewares.registry-redirect.redirectScheme.scheme=https"
+      - "traefik.http.middlewares.registry-redirect.redirectScheme.permanent=true"
+      - "traefik.http.routers.registry-http.rule=Host(`registry.bachelart.fr`) && !PathPrefix(`/.well-known/acme-challenge/`)"
+      - "traefik.http.routers.registry-http.entrypoints=web"
+      - "traefik.http.routers.registry-http.middlewares=registry-redirect"
+
+
+# =============================================================================
+# RÉSEAUX
+# -----------------------------------------------------------------------------
+# Tous les réseaux sont déclarés external: true — ils sont créés une fois par
+# `deploy.sh networks` et partagés entre tous les projets du VPS.
+# =============================================================================
+volumes:
+  registry_data:
+
+networks:
+  traefik-web:
+    external: true

@@ -1,0 +1,15 @@
+# =============================================================================
+# Prometheus datasource — provisionnée automatiquement dans Grafana
+# =============================================================================
+# Datasource chargée au démarrage de Grafana — pas besoin de cliquer dans l'UI.
+# Pointe vers Prometheus sur le réseau monitoring-network.
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true

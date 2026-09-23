@@ -2,14 +2,20 @@
 # =============================================================================
 # deploy.sh — Orchestrateur de l'infrastructure Docker partagée
 # =============================================================================
-# Usage: ./deploy.sh <sous-commande>
+# Usage: ./scripts/deploy.sh <sous-commande>
+#
+# Ce repo NE contient PAS les apps (portfolio, poker_training) — chacune
+# garde son compose.yml + .env dans son propre projet. Ici : uniquement
+# ce qui est partagé entre tous les projets (réseaux, traefik, monitoring,
+# registry).
 #
 # Sous-commandes :
-#   networks     Créer les réseaux Docker partagés (fait)
-#   traefik      Déployer Traefik (fait)
-#   registry     Déployer le registry privé (fait)
-#   monitoring   Déployer la stack monitoring (à venir)
-#   all          Déployer toute l'infra (à venir)
+#   networks     Créer les réseaux Docker partagés (idempotent)
+#   traefik      Déployer Traefik v3 (reverse proxy + Let's Encrypt)
+#   registry     Déployer le registry Docker privé (auth htpasswd)
+#   monitoring   Déployer la stack monitoring (Prometheus + Loki + Grafana
+#                + cAdvisor + node-exporter + Promtail)
+#   all          Déployer toute l'infra partagée
 # =============================================================================
 
 set -euo pipefail
@@ -27,27 +33,24 @@ log_info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
-# ── Sous-commande : networks ──
-cmd_networks() {
-  log_info "Création des réseaux Docker partagés..."
-
-  for net in traefik-web monitoring-network; do
-    if docker network ls --format '{{.Name}}' | grep -q "^$net$"; then
-      log_warn "Réseau '$net' existe déjà — ignoré."
-    else
-      docker network create --driver bridge "$net"
-      log_info "Réseau '$net' créé."
-    fi
-  done
-
-  log_info "✓ Réseaux terminé."
+# ── Helper : ensure_network ────────────────────────────────────────────
+# Crée un réseau Docker s'il n'existe pas déjà (idempotent)
+ensure_network() {
+  docker network inspect "$1" >/dev/null 2>&1 || docker network create "$1"
 }
 
-# ── Sous-commande : traefik ───────────────────────────────────────────────────
+# ── Sous-commande : networks ──────────────────────────────────────────
+cmd_networks() {
+  log_info "Vérification des réseaux partagés..."
+  ensure_network traefik-web
+  ensure_network monitoring-network
+  log_info "✓ traefik-web + monitoring-network prêts"
+}
+
+# ── Sous-commande : traefik ────────────────────────────────────────────
 cmd_traefik() {
   log_info "Déploiement de Traefik v3..."
 
-  # Créer acme.json si absent (sinon Traefik refuse de démarrer)
   if [[ ! -f "$PROJECT_ROOT/traefik/acme.json" ]]; then
     touch "$PROJECT_ROOT/traefik/acme.json"
     chmod 600 "$PROJECT_ROOT/traefik/acme.json"
@@ -60,27 +63,23 @@ cmd_traefik() {
   log_info "✓ Traefik déployé."
 }
 
-# ── Sous-commande : registry ───────────────────────────────────────────────────
+# ── Sous-commande : registry ────────────────────────────────────────────
 cmd_registry() {
-  echo "🚀 Déploiement registry Docker..."
+  log_info "Déploiement du registry Docker..."
 
-  # Charger .env s'il existe
   if [[ -f "$PROJECT_ROOT/.env" ]]; then
     set -a
     source "$PROJECT_ROOT/.env"
     set +a
   fi
 
-  # Vérifier que htpasswd est disponible
   if ! command -v htpasswd &> /dev/null; then
     log_error "htpasswd absent — installe apache2-utils (apt install apache2-utils)"
     exit 1
   fi
 
-  # Créer le dossier data si absent
   mkdir -p "$PROJECT_ROOT/registry/data"
 
-  # Générer htpasswd si absent
   if [[ -f "$PROJECT_ROOT/registry/htpasswd" ]]; then
     log_warn "htpasswd existe déjà."
   else
@@ -94,24 +93,59 @@ cmd_registry() {
   fi
 
   docker compose -f "$PROJECT_ROOT/registry/docker-compose.yml" up -d
-  log_info "✅ Registry lancé"
+  log_info "✓ Registry déployé."
 }
 
-# ── Aide ──────────────────────────────────────────────────────────────────────
+# ── Sous-commande : monitoring ─────────────────────────────────────────
+cmd_monitoring() {
+  log_info "Déploiement de la stack monitoring (Prometheus, Loki, Grafana, cAdvisor, Promtail)..."
+
+  ensure_network traefik-web
+  ensure_network monitoring-network
+
+  mkdir -p "$PROJECT_ROOT/monitoring/prometheus/rules"
+  mkdir -p "$PROJECT_ROOT/monitoring/loki"
+  mkdir -p "$PROJECT_ROOT/monitoring/promtail"
+  mkdir -p "$PROJECT_ROOT/monitoring/grafana/datasources"
+  mkdir -p "$PROJECT_ROOT/monitoring/grafana/dashboards"
+
+  docker compose -f "$PROJECT_ROOT/monitoring/compose.monitoring.yml" \
+    --env-file "$PROJECT_ROOT/monitoring/.env.monitoring" up -d
+
+  log_info "✓ Monitoring déployé."
+  log_info "  Prometheus : http://localhost:9090"
+  log_info "  Grafana    : https://monitoring.bachelart.fr"
+}
+
+# ── Sous-commande : all ────────────────────────────────────────────────
+cmd_all() {
+  log_info "Déploiement complet de l'infra partagée..."
+  cmd_networks
+  cmd_traefik
+  cmd_monitoring
+  cmd_registry
+  log_info "✓ Infra partagée (traefik + monitoring + registry) déployée."
+}
+
+# ── Aide ───────────────────────────────────────────────────────────────
 cmd_help() {
   cat <<EOF
 Usage: $(basename "$0") <sous-commande>
 
 Sous-commandes :
   networks     Créer les réseaux Docker partagés (idempotent)
-  traefik      Déployer Traefik
-  registry     Déployer registry
+  traefik      Déployer Traefik v3 (reverse proxy + Let's Encrypt)
+  registry     Déployer le registry Docker privé (auth htpasswd)
+  monitoring   Déployer la stack monitoring
+  all          Déployer toute l'infra partagée
+
 Exemple :
   ./scripts/deploy.sh networks
+  ./scripts/deploy.sh all
 EOF
 }
 
-# ── Dispatch ──
+# ── Dispatch ── ( dirige le flux )
 main() {
   if [[ $# -lt 1 ]]; then
     cmd_help
@@ -122,8 +156,10 @@ main() {
     networks)     cmd_networks    "$@" ;;
     traefik)      cmd_traefik     "$@" ;;
     registry)     cmd_registry    "$@" ;;
+    monitoring)   cmd_monitoring  "$@" ;;
+    all)          cmd_all         "$@" ;;
     *)
-        log_error "Sous-commande inconnue :  $1"
+        log_error "Sous-commande inconnue : $1"
         cmd_help
         exit 1
         ;;

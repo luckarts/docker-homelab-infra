@@ -1,4 +1,14 @@
+# Secrets — never commit
 .env
+.env.*
+!.env.*.example
 acme.json
-*.log
 ./traefik/acme.json
+
+# Monitoring — data persistantes (ne pas versionner)
+monitoring/prometheus/data/
+monitoring/loki/data/
+monitoring/grafana/data/
+
+# OS / editor cruft
+*.log

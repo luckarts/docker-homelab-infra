@@ -1,0 +1,190 @@
+# =============================================================================
+# compose.monitoring.yml — Stack monitoring centralisé
+# =============================================================================
+# Orchestre l'ensemble des services d'observabilité de base : métriques
+# (Prometheus), logs (Loki), tableau de bord (Grafana), collecteurs
+# (cAdvisor, Promtail).
+#
+# Architecture :
+#   - Tous les services internes communiquent sur monitoring-network
+#   - Grafana est le seul service exposé via Traefik (monitoring.bachelart.fr)
+#   - cAdvisor, Prometheus, Loki, Promtail sont internes
+#
+# Pièges :
+#   - Loki nécessite un init container pour les permissions (UID 10001)
+#   - cAdvisor a besoin de --privileged pour lire /dev/kmsg
+#   - Grafana en anonymous Viewer expose logs/métriques sur internet
+#     — l'IP whitelist Traefik est obligatoire
+#   - node-exporter est en network_mode: host (lit /proc, /sys de l'hôte)
+# =============================================================================
+
+services:
+  # ==========================================================================
+  # SERVICE : prometheus
+  # --------------------------------------------------------------------------
+  #   - Métriques : CPU, RAM, requêtes HTTP, latence
+  #   - Scrape Traefik (8082), cAdvisor (8080), node-exporter (9100),
+  #     lui-même (9090)
+  #   - Alertes évaluées toutes les 15s via rules/*.yml
+  #   - Pas de route Traefik — accessible uniquement sur monitoring-network
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+    networks:
+      - monitoring-network
+
+  # ==========================================================================
+  # SERVICE : node-exporter
+  # --------------------------------------------------------------------------
+  #   - Métriques du HOST (CPU, RAM, disque, réseau)
+  #   - network_mode: host — nécessaire pour lire /proc, /sys de l'hôte
+  #   - Pas de DNS Docker (network_mode: host) — scrapé sur localhost:9100
+  # ==========================================================================
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - '--path.rootfs=/host'
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+    volumes:
+      - /:/host:ro,rslave
+
+  # ==========================================================================
+  # SERVICE : cadvisor
+  # --------------------------------------------------------------------------
+  #   - Métriques PAR CONTAINER (CPU, RAM, réseau)
+  #   - Lit les cgroups Linux via /sys, découvre les containers via le socket
+  #   - Scrapé par Prometheus sur cadvisor:8080
+  #   - NE DOIT PAS être accessible depuis l'extérieur
+  # ==========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - monitoring-network
+
+  # ==========================================================================
+  # SERVICE : grafana
+  # --------------------------------------------------------------------------
+  #   - Tableau de bord unifié (métriques Prometheus + logs Loki)
+  #   - Datasources et dashboards provisionnés automatiquement
+  #   - SEUL service exposé via Traefik (monitoring.bachelart.fr)
+  #   - IP whitelist obligatoire (anonymous Viewer = accès public)
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/grafana.ini:/etc/grafana/grafana.ini:ro
+    networks:
+      - monitoring-network
+      - traefik-web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`monitoring.bachelart.fr`)"
+      - "traefik.http.routers.grafana.entrypoints=websecure"
+      - "traefik.http.routers.grafana.tls.certresolver=letsencrypt"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+      - "traefik.http.middlewares.grafana-ipwhitelist.ipallowlist.sourcerange=37.67.207.33/32"
+      - "traefik.http.routers.grafana.middlewares=grafana-ipwhitelist"
+
+  # ==========================================================================
+  # SERVICE : loki-init
+  # --------------------------------------------------------------------------
+  #   - Service one-shot : corrige les permissions du volume Loki
+  #   - Loki tourne avec UID 10001 (non-root) — le dossier doit lui appartenir
+  #   - Ne tourne qu'au premier déploiement (restart: "no")
+  # ==========================================================================
+  loki-init:
+    image: alpine:latest
+    container_name: loki-init
+    command: ["sh", "-c", "mkdir -p /data/loki && chown -R 10001:10001 /data/loki"]
+    volumes:
+      - loki-data:/data/loki
+    restart: "no"
+
+  # ==========================================================================
+  # SERVICE : loki
+  # --------------------------------------------------------------------------
+  #   - Agrégation de logs centralisée
+  #   - Reçoit les logs de Promtail (push) et les stocke
+  #   - Indexe les labels (compose_project, container_name...)
+  #   - Pas d'auth en interne (auth_enabled: false)
+  # ==========================================================================
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: unless-stopped
+    depends_on:
+      loki-init:
+        condition: service_completed_successfully
+    command:
+      - '-config.file=/etc/loki/loki.yml'
+    volumes:
+      - ./loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki-data:/data/loki
+    networks:
+      - monitoring-network
+
+  # ==========================================================================
+  # SERVICE : promtail
+  # --------------------------------------------------------------------------
+  #   - Collecteur de logs : envoie les logs Docker à Loki
+  #   - Découvre les containers via le socket Docker (docker_sd_configs)
+  #   - Ajoute des labels : compose_project, compose_service, container_name
+  # ==========================================================================
+  promtail:
+    image: grafana/promtail:latest
+    container_name: promtail
+    restart: unless-stopped
+    command:
+      - '-config.file=/etc/promtail/promtail.yml'
+    volumes:
+      - ./promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitoring-network
+
+networks:
+  monitoring-network:
+    external: true
+  traefik-web:
+    external: true
+
+volumes:
+  grafana-data:
+  loki-data:

@@ -1,0 +1,40 @@
+# =============================================================================
+# alerts.yml — Règles d'alerte Prometheus (infra partagée)
+# =============================================================================
+# Chaque alerte définit :
+#   - alert  : nom de l'alerte (affiché dans Grafana, envoyé à Alertmanager)
+#   - expr   : expression PromQL — condition qui déclenche l'alerte
+#   - for    : durée pendant laquelle la condition doit être vraie
+#   - labels : sévérité (warning, critical) + équipe responsable
+#   - annotations : message lisible (summary + description)
+#
+# PromQL de base :
+#   - up == 0                    : le target ne répond pas
+#   - rate(container_cpu...[5m]) : utilisation CPU moyennée sur 5min
+#   - node_filesystem_avail_bytes: espace disque restant
+# =============================================================================
+
+groups:
+  - name: infra
+    rules:
+      # ── Instance Down ──────────────────────────────────────────────────
+      # Un service Prometheus ne répond plus depuis 1 minute
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Instance {{ $labels.instance }} down"
+          description: "{{ $labels.job }} ne répond plus depuis 1 minute."
+
+      # ── CPU Élevé ──────────────────────────────────────────────────────
+      # Un container utilise plus de 80% CPU depuis 5 minutes
+      - alert: HighCpuUsage
+        expr: rate(container_cpu_usage_seconds_total[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU > 80% sur {{ $labels.name }}"
+          description: "Le container {{ $labels.name }} utilise plus de 80% CPU depuis 5 minutes."

@@ -1,0 +1,53 @@
+# =============================================================================
+# security-alerts.yml — Regles d'alerte de securite (CrowdSec)
+# =============================================================================
+# Ces alertes exploitent les metriques exposees par CrowdSec.
+# Necessite que CrowdSec soit deploye et scrape par Prometheus.
+# =============================================================================
+
+groups:
+  - name: security
+    rules:
+      # ── SSH bruteforce detecte ──────────────────────────────────────────
+      # CrowdSec a banni une IP pour SSH bruteforce
+      - alert: SSHBruteforceDetected
+        expr: rate(crowdsec_decisions_total{scenario="crowdsecurity/ssh-bf"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SSH bruteforce detecte"
+          description: "CrowdSec a detecte une tentative SSH bruteforce — IP bannie."
+
+      # ── IPs bannies simultanees ─────────────────────────────────────────
+      # Plus de 5 IPs bannies en meme temps
+      - alert: CrowdSecBannedIPs
+        expr: crowdsec_decisions_total > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Plus de 5 IPs bannies simultanement"
+          description: "{{ $value }} IPs sont actuellement bannies par CrowdSec."
+
+      # ── CrowdSec down ───────────────────────────────────────────────────
+      # CrowdSec ne repond plus (scrape Prometheus echoue)
+      - alert: CrowdSecDown
+        expr: up{job="crowdsec"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CrowdSec est down"
+          description: "CrowdSec n'est plus accessible — verifier le conteneur."
+
+      # ── Attaque HTTP detectee ───────────────────────────────────────────
+      # CrowdSec a banni une IP pour attaque HTTP (scan, crawl, bad-ua)
+      - alert: HTTPAttackDetected
+        expr: rate(crowdsec_decisions_total{scenario=~"crowdsecurity/http-.*"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Attaque HTTP detectee"
+          description: "CrowdSec a detecte une attaque HTTP (scan/crawl/bad-ua)."

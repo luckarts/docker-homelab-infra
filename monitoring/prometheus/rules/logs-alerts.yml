@@ -1,0 +1,56 @@
+# =============================================================================
+# logs-alerts.yml — Regles d'alerte liees aux logs et au comportement applicatif
+# =============================================================================
+# Ces alertes completent les alertes infra (InstanceDown, HighCpuUsage).
+# Elles detectent des anomalies metier visibles dans les metriques Traefik
+# et les logs containers.
+#
+# Necessite Alertmanager pour les notifications email.
+# =============================================================================
+
+groups:
+  - name: logs
+    rules:
+      # ── Taux d'erreur HTTP 5xx eleve ───────────────────────────────────
+      # Plus de 0.5 requetes/s retournant 5xx pendant 5 minutes
+      - alert: HighErrorRate
+        expr: sum(rate(traefik_service_request_duration_seconds_count{code=~"5.."}[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Taux d'erreur HTTP 5xx eleve"
+          description: "Plus de 0.5 req/s en 5xx pendant 5 minutes."
+
+      # ── Container en crash-loop ─────────────────────────────────────────
+      # Un conteneur a redemarre plus de 3 fois en 10 minutes
+      - alert: ContainerRestartLoop
+        expr: rate(container_last_seen[10m]) > 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Un conteneur a redemarre plus de 3 fois en 10 minutes"
+          description: "Verifier l'etat des conteneurs Docker."
+
+      # ── Latence Traefik elevee ──────────────────────────────────────────
+      # P95 des requetes > 5 secondes
+      - alert: TraefikHighLatency
+        expr: histogram_quantile(0.95, sum(rate(traefik_service_request_duration_seconds_bucket[5m])) by (le)) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Latence Traefik P95 > 5s"
+          description: "La latence P95 des requetes depasse 5 secondes."
+
+      # ── Absence de logs ─────────────────────────────────────────────────
+      # Aucun log recu d'un conteneur depuis 5 minutes
+      - alert: NoLogsFromContainer
+        expr: count_over_time({container_name=~".+"}[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aucun log recu d'un conteneur depuis 5 minutes"
+          description: "Verifier que Promtail collecte bien les logs Docker."

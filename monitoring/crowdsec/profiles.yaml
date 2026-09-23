@@ -1,0 +1,22 @@
+# =============================================================================
+# profiles.yaml — Profils de remediation CrowdSec
+# =============================================================================
+# Decisions prises quand une alerte CrowdSec se declenche :
+#   - Ip    : bannissement de l'IP pendant 4h
+#   - Range : bannissement de la plage IP pendant 4h
+# =============================================================================
+name: default_ip_remediation
+filters:
+ - Alert.Remediation == true && Alert.GetScope() == "Ip"
+decisions:
+ - type: ban
+   duration: 4h
+on_success: break
+---
+name: default_range_remediation
+filters:
+ - Alert.Remediation == true && Alert.GetScope() == "Range"
+decisions:
+ - type: ban
+   duration: 4h
+on_success: break

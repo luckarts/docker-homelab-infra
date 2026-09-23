@@ -1,0 +1,70 @@
+{
+  "title": "CrowdSec — Securite",
+  "uid": "crowdsec-dashboard",
+  "tags": ["security", "crowdsec"],
+  "timezone": "browser",
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": { "list": [] },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "title": "IPs Bannies",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "targets": [
+        { "expr": "crowdsec_decisions_total", "legendFormat": "IPs bannies", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Etat du Bouncer",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "id": 2,
+      "targets": [
+        { "expr": "crowdsec_bouncers_total", "legendFormat": "Bouncers actifs", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Decisions par Scénario",
+      "type": "piechart",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "id": 3,
+      "targets": [
+        { "expr": "sum(crowdsec_decisions_total) by (scenario)", "legendFormat": "{{ scenario }}", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Requêtes Analysées (Traefik)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 4,
+      "targets": [
+        { "expr": "rate(crowdsec_requests_total[5m])", "legendFormat": "req/s analysees", "refId": "A" }
+      ]
+    },
+    {
+      "title": "Alertes Actives",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 5,
+      "targets": [
+        { "expr": "crowdsec_alerts_total", "legendFormat": "Alertes", "refId": "A" }
+      ]
+    }
+  ]
+}

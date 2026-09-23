@@ -1,11 +1,12 @@
 # =============================================================================
 # prometheus.yml — Configuration de scraping Prometheus
 # =============================================================================
-# Prometheus scrape les métriques de l'infra partagée :
+# Prometheus scrape les metriques de l'infra partagee :
 #   - Traefik      (port 8082) : req/s, latence, codes HTTP par routeur
 #   - node-exporter (port 9100) : CPU, RAM, disque du HOST
-#   - cAdvisor     (port 8080) : CPU, RAM, réseau par container
-#   - Lui-même     (port 9090) : auto-monitoring (vérifier qu'il tourne)
+#   - cAdvisor     (port 8080) : CPU, RAM, reseau par container
+#   - CrowdSec     (port 6060) : decisions, IPs bannies, securite
+#   - Lui-meme     (port 9090) : auto-monitoring
 #
 # Les cibles sont des noms DNS Docker — résolus sur monitoring-network.
 # Tant qu'un service est sur ce réseau, Prometheus peut le scraper.
@@ -34,6 +35,12 @@ scrape_configs:
   - job_name: 'cadvisor'
     static_configs:
       - targets: ['cadvisor:8080']
+
+  # ── CrowdSec ───────────────────────────────────────────────────────────
+  # Métriques de sécurité : IPs bannies, décisions actives, requêtes analysées
+  - job_name: 'crowdsec'
+    static_configs:
+      - targets: ['crowdsec:6060']
 
   # ── Auto-monitoring ────────────────────────────────────────────────────
   # Vérifie que Prometheus lui-même tourne

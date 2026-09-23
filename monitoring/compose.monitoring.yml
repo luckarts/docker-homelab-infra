@@ -1,14 +1,14 @@
 # =============================================================================
 # compose.monitoring.yml — Stack monitoring centralisé
 # =============================================================================
-# Orchestre l'ensemble des services d'observabilité de base : métriques
-# (Prometheus), logs (Loki), tableau de bord (Grafana), collecteurs
-# (cAdvisor, Promtail).
+# Orchestre l'ensemble des services d'observabilité : métriques (Prometheus),
+# logs (Loki), tableau de bord (Grafana), collecteurs (cAdvisor, Promtail),
+# alerting (Alertmanager) et sécurité (CrowdSec).
 #
 # Architecture :
 #   - Tous les services internes communiquent sur monitoring-network
 #   - Grafana est le seul service exposé via Traefik (monitoring.bachelart.fr)
-#   - cAdvisor, Prometheus, Loki, Promtail sont internes
+#   - Alertmanager et CrowdSec sont internes
 #
 # Pièges :
 #   - Loki nécessite un init container pour les permissions (UID 10001)
@@ -16,6 +16,7 @@
 #   - Grafana en anonymous Viewer expose logs/métriques sur internet
 #     — l'IP whitelist Traefik est obligatoire
 #   - node-exporter est en network_mode: host (lit /proc, /sys de l'hôte)
+#   - CrowdSec expose sa LAPI sur 127.0.0.1:8080 pour le bouncer natif
 # =============================================================================
 
 services:
@@ -179,6 +180,60 @@ services:
     networks:
       - monitoring-network
 
+  # ==========================================================================
+  # SERVICE : alertmanager
+  # --------------------------------------------------------------------------
+  #   - Notifications email (Brevo SMTP) quand une alerte Prometheus se déclenche
+  #   - Entrypoint : génère alertmanager.yml depuis un template + variables env
+  #   - Credentials SMTP depuis .env.monitoring
+  # ==========================================================================
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/etc/alertmanager/entrypoint.sh"]
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    environment:
+      ALERTMANAGER_SMTP_USERNAME: ${ALERTMANAGER_SMTP_USERNAME:-}
+      ALERTMANAGER_SMTP_PASSWORD: ${ALERTMANAGER_SMTP_PASSWORD:-}
+    volumes:
+      - ./alertmanager/alertmanager.template.yml:/etc/alertmanager/alertmanager.template.yml:ro
+      - ./alertmanager/entrypoint.sh:/etc/alertmanager/entrypoint.sh:ro
+      - ./alertmanager/templates:/etc/alertmanager/templates:ro
+    networks:
+      - monitoring-network
+
+  # ==========================================================================
+  # SERVICE : crowdsec
+  # --------------------------------------------------------------------------
+  #   - Détection d'intrusion (bruteforce SSH, scans HTTP, CVEs)
+  #   - LAPI exposée sur 127.0.0.1:8080 pour le bouncer natif (iptables)
+  #   - Pas d'image Docker pour cs-firewall-bouncer — installé natif
+  #   - Acquis : logs auth.log, syslog, socket Docker (logs Traefik)
+  # ==========================================================================
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    restart: unless-stopped
+    environment:
+      COLLECTIONS: 'crowdsecurity/linux crowdsecurity/nginx crowdsecurity/traefik crowdsecurity/http-cve'
+      GID: "${PGID:-1000}"
+      UID: "${PUID:-1000}"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - crowdsec-db:/var/lib/crowdsec/data
+      - crowdsec-config:/etc/crowdsec
+      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml:ro
+      - ./crowdsec/profiles.yaml:/etc/crowdsec/profiles.yaml:ro
+      - /var/log/auth.log:/var/log/auth.log:ro
+      - /var/log/syslog:/var/log/syslog:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitoring-network
+
 networks:
   monitoring-network:
     external: true
@@ -188,3 +243,5 @@ networks:
 volumes:
   grafana-data:
   loki-data:
+  crowdsec-db:
+  crowdsec-config:

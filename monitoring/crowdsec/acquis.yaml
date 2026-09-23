@@ -1,0 +1,22 @@
+# =============================================================================
+# acquis.yaml — Sources de logs pour CrowdSec
+# =============================================================================
+# CrowdSec analyse les logs pour détecter les intrusions :
+#   - /var/log/auth.log  : tentatives de connexion SSH
+#   - /var/log/syslog    : événements système
+#   - Traefik (Docker)   : requêtes HTTP (scans, CVEs, brute force)
+# =============================================================================
+
+filenames:
+  - /var/log/auth.log
+  - /var/log/syslog
+
+labels:
+  type: syslog
+
+---
+source: docker
+labels:
+  type: traefik
+container_name:
+  - traefik

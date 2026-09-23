@@ -1,0 +1,383 @@
+# =============================================================================
+# deploy.yml — Template CI/CD pour projet Docker (GitHub Actions)
+# =============================================================================
+# Template prêt à l'emploi pour build/push/deploy une app Docker vers un
+# registry privé, avec isolation staging → production et SSH gate.
+#
+# Comment l'utiliser :
+#   1. Copier ce fichier dans .github/workflows/deploy.yml de votre projet
+#   2. Remplacer "my-app" par le nom de votre projet
+#   3. Configurer les secrets GitHub (REGISTRY_HOST, ORACLE_SSH_KEY, etc.)
+#   4. Pousser sur main → le pipeline déploie en staging, puis en prod
+#
+# Dépendances serveur :
+#   - ci-gate.sh (forced command SSH) qui reçoit "deploy <projet> <env> <sha>"
+#   - deploy.sh sur le serveur pour orchestrer docker compose up
+#   - Un dossier deploy/ dans votre repo avec docker-compose.yml + scripts
+#
+# Pièges :
+#   - Les secrets GitHub ne sont pas accessibles depuis un fork / PR externe
+#   - concurrency group + cancel-in-progress évite les déploiements en parallèle
+#   - Le job prod dépend du job staging : si staging échoue, prod ne démarre pas
+#   - Les tags docker sont basés sur le SHA git → pas de collision, rollback facile
+#   - L'OS du runner doit correspondre à l'architecture cible (linux/arm64 ici)
+# =============================================================================
+
+# ── Nom du workflow ───────────────────────────────────────────────────────────
+# S'affiche dans l'onglet "Actions" du repo GitHub.
+name: Build and Deploy
+
+# =============================================================================
+# DÉCLENCHEURS (on)
+# -----------------------------------------------------------------------------
+# Le pipeline peut être déclenché de trois façons :
+#   1. Push sur main ou develop (déploiement automatique)
+#   2. Déclenchement manuel via l'UI GitHub (workflow_dispatch)
+#   3. (Optionnel) Schedule cron — décommenter si besoin de rebuild périodique
+#
+# Flux typique :
+#   develop → build + staging uniquement
+#   main    → build + staging (si développé) + production
+# =============================================================================
+on:
+  # ── Push : déploiement automatique ─────────────────────────────────────────
+  push:
+    branches:
+      - main
+      - develop
+
+  # ── Manuel : déclenchement via l'UI GitHub ─────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild and redeploy'
+        required: false
+        type: boolean
+        default: false
+      debug_ssh:
+        description: 'Enable verbose SSH debug output'
+        required: false
+        type: boolean
+        default: false
+
+  # ── (Optionnel) Schedule : rebuild périodique ──────────────────────────────
+  # Décommentez pour rebuild automatique (ex: mise à jour sécurité de l'OS)
+  # schedule:
+  #   - cron: '0 6 * * 1'  # Tous les lundis à 6h UTC
+
+# =============================================================================
+# PERMISSIONS ET CONCURRENCE
+# -----------------------------------------------------------------------------
+# permissions : limiter ce que le token GITHUB_TOKEN peut faire (sécurité)
+# concurrency : empêcher deux déploiements du même workflow sur la même branche
+# =============================================================================
+permissions:
+  contents: read        # Lecture seule du repo — le CI n'a pas besoin d'écrire
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================================
+# VARIABLES D'ENVIRONNEMENT (env)
+# -----------------------------------------------------------------------------
+# Accessibles par toutes les étapes de tous les jobs.
+# Ne mettez ici QUE des valeurs non-sensibles ou issues de secrets.
+# =============================================================================
+env:
+  REGISTRY: ${{ secrets.REGISTRY_HOST }}  # Ex: registry.bachelart.fr
+  PROJECT_NAME: my-app                     # ⚠️ À CHANGER : nom de votre projet
+
+# =============================================================================
+# JOBS
+# =============================================================================
+jobs:
+
+  # ============================================================================
+  # JOB 1 : build
+  # ----------------------------------------------------------------------------
+  # Build et push les images Docker vers le registry privé.
+  #
+  # Pourquoi plusieurs targets :
+  #   - runner : l'application elle-même (Next.js, API, etc.)
+  #   - migrate : le conteneur qui exécute les migrations de base de données
+  #   - Ajoutez d'autres targets selon vos besoins (worker, cron, etc.)
+  #
+  # Tags :
+  #   - ${{ github.sha }} : tag unique, traçable jusqu'au commit
+  #   - latest-<env> : tag "latest" par environnement (staging / prod)
+  #   - Les deux permettent : rollback fixe (SHA) ou déploiement courant (latest)
+  #
+  # Cache :
+  #   - cache-from: type=gha → réutilise les couches du run précédent
+  #   - cache-to: type=gha,mode=max → sauvegarde MAX couches (pas seulement les
+  #     couches en cache, ce qui est le comportement par défaut de mode=min)
+  #   - Accélère considérablement les builds (~minutes au lieu de dizaines)
+  # ============================================================================
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    steps:
+      # ── Étape 1 : Récupérer le code source ───────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Étape 2 : Configurer Docker Buildx ───────────────────────────────
+      # Builder multi-architecture (amd64, arm64) avec support du cache.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Étape 3 : Authentification au registry privé ─────────────────────
+      # Les credentials sont stockés dans les secrets GitHub (Settings → Secrets).
+      # Jamais de hardcode — le secret est injecté par GitHub au moment du run.
+      # Trois secrets requis :
+      #   - REGISTRY_HOST : URL du registry (ex: registry.bachelart.fr)
+      #   - REGISTRY_USER : nom d'utilisateur htpasswd
+      #   - REGISTRY_PASSWORD : mot de passe htpasswd (ou token CI dédié)
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      # ── Étape 4 : Build + push (target: runner) ──────────────────────────
+      # L'image principale de l'application.
+      # Targets Docker = stages dans le Dockerfile (truc multi-stage).
+      # platform: architecture du VPS cible (ici ARM64 — Oracle Cloud).
+      - name: Build and push (runner)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runner
+          push: true
+          # ── Architecture ──────────────────────────────────────────────────
+          # ⚠️ À CHANGER : linux/amd64 si votre VPS est x86_64.
+          platforms: linux/arm64
+          # ── Tags ──────────────────────────────────────────────────────────
+          # Le SHA identifie la version exacte. Le tag "latest" identifie la
+          # version courante pour un environnement donné — pratique pour
+          # docker compose qui peut référencer un tag fixe.
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.PROJECT_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.PROJECT_NAME }}:latest-${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }}
+          # ── Cache Docker Buildx ──────────────────────────────────────────
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Étape 5 : Build + push (target: migrate) ─────────────────────────
+      # Image annexe pour les migrations (DB, seed, etc.).
+      # Facultative — supprimez cette étape si votre projet n'en a pas besoin.
+      - name: Build and push (migrate)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: migrate
+          push: true
+          platforms: linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.PROJECT_NAME }}:migrate-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.PROJECT_NAME }}:migrate-latest-${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # JOB 2 : deploy-staging
+  # ----------------------------------------------------------------------------
+  # Déploie sur l'environnement de staging (validation avant prod).
+  #
+  # Conditions :
+  #   - Uniquement sur la branche develop
+  #   - Dépend du job build — si build échoue, staging ne démarre pas
+  #
+  # Sécurité :
+  #   - SSH via ci-gate.sh (forced command) : le CI ne peut exécuter QUE
+  #     "deploy my-app staging <sha>". Pas de shell, pas de commande arbitraire.
+  #   - La clé SSH (ORACLE_SSH_KEY) est stockée dans les secrets GitHub.
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' && (always() && needs.build.result == 'success')
+    environment: staging
+    steps:
+      # ── Étape 1 : Checkout (nécessaire pour les fichiers deploy/) ────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Étape 2 : Configuration SSH ──────────────────────────────────────
+      # Configure le client SSH pour se connecter au VPS via la clé privée.
+      # La clé est stockée dans les secrets GitHub et peut être :
+      #   - Une clé dédiée CI (recommandé) : liée à ci-gate via authorized_keys
+      #   - Limitée par forced command : même si la clé fuit, pas de shell
+      #   - Remplaçable sans impacter les autres accès au serveur
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ORACLE_SSH_KEY }}" > ~/.ssh/oracle
+          chmod 600 ~/.ssh/oracle
+          cat >> ~/.ssh/config <<EOF
+          Host oracle
+            HostName ${{ secrets.ORACLE_HOST }}
+            User ${{ secrets.ORACLE_SSH_USER }}
+            IdentityFile ~/.ssh/oracle
+            StrictHostKeyChecking accept-new
+            UpdateHostKeys no
+          EOF
+
+      # ── (Optionnel) Étape 3 : Debug SSH ──────────────────────────────────
+      # Active les logs détaillés SSH si demandé (debug_ssh = true dans le
+      # déclenchement manuel). Utile quand la connexion échoue mystérieusement.
+      - name: Debug SSH
+        if: ${{ inputs.debug_ssh || false }}
+        run: ssh -vvv -o BatchMode=yes -o ConnectTimeout=10 oracle ping || true
+
+      # ── Étape 4 : Synchronisation des fichiers deploy/ ───────────────────
+      # Copie les fichiers de configuration (docker-compose.yml, scripts)
+      # vers le serveur AVANT de déployer. Cela permet de versionner la config
+      # dans le même repo que le code.
+      #
+      # Exclusions de sécurité :
+      #   - .env.*      : les secrets ne sont jamais transférés par rsync
+      #   - acme.json   : certificats TLS du VPS (propres au serveur)
+      #   - htpasswd    : fichiers d'authentification (propres au serveur)
+      - name: Sync deploy files
+        env:
+          SSH_VERBOSE: ${{ inputs.debug_ssh && '-vvv' || '' }}
+        run: |
+          rsync -avz --delete \
+            --exclude='.env.*' \
+            --exclude='acme.json' \
+            --exclude='htpasswd' \
+            -e "ssh $SSH_VERBOSE" \
+            deploy/ oracle:/home/deploy/${{ env.PROJECT_NAME }}/deploy/
+
+      # ── Étape 5 : Déploiement via SSH gate ───────────────────────────────
+      # La seule commande exécutée sur le serveur. ci-gate.sh reçoit :
+      #   deploy <projet> <environnement> <sha>
+      # et orchestre le docker compose up avec la bonne image taguée.
+      # Aucun secret ne passe en paramètre SSH.
+      - name: Deploy
+        env:
+          SSH_VERBOSE: ${{ inputs.debug_ssh && '-vvv' || '' }}
+        run: ssh $SSH_VERBOSE oracle "deploy ${{ env.PROJECT_NAME }} staging ${{ github.sha }}"
+
+  # ============================================================================
+  # JOB 3 : deploy-prod
+  # ----------------------------------------------------------------------------
+  # Déploie sur l'environnement de production.
+  #
+  # Conditions de déclenchement (ligne 131-135) :
+  #   - Uniquement sur la branche main
+  #   - Le job build doit avoir réussi
+  #   - Le job staging doit avoir réussi OU être skip
+  #     (staging est skip si on push sur main directement, ce qui arrive lors
+  #     d'un merge de PR — la CI a déjà validé staging sur la branche source)
+  #
+  # Environnement GitHub "production" :
+  #   - Permet d'isoler les secrets prod des secrets staging
+  #   - Ajoute un approver optionnel (bouton "Review deployments" dans l'UI)
+  #   - Le tag latest-prod est utilisé par docker compose en production
+  # ============================================================================
+  deploy-prod:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    environment: production
+    steps:
+      # ── Étape 1 : Checkout ───────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Étape 2 : Configuration SSH (identique au staging) ───────────────
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.ORACLE_SSH_KEY }}" > ~/.ssh/oracle
+          chmod 600 ~/.ssh/oracle
+          cat >> ~/.ssh/config <<EOF
+          Host oracle
+            HostName ${{ secrets.ORACLE_HOST }}
+            User ${{ secrets.ORACLE_SSH_USER }}
+            IdentityFile ~/.ssh/oracle
+            StrictHostKeyChecking accept-new
+            UpdateHostKeys no
+          EOF
+
+      # ── (Optionnel) Étape 3 : Debug SSH ──────────────────────────────────
+      - name: Debug SSH
+        if: ${{ inputs.debug_ssh || false }}
+        run: ssh -vvv -o BatchMode=yes -o ConnectTimeout=10 oracle ping || true
+
+      # ── Étape 4 : Synchronisation deploy/ ─────────────────────────────────
+      - name: Sync deploy files
+        env:
+          SSH_VERBOSE: ${{ inputs.debug_ssh && '-vvv' || '' }}
+        run: |
+          rsync -avz --delete \
+            --exclude='.env.*' \
+            --exclude='acme.json' \
+            --exclude='htpasswd' \
+            -e "ssh $SSH_VERBOSE" \
+            deploy/ oracle:/home/deploy/${{ env.PROJECT_NAME }}/deploy/
+
+      # ── Étape 5 : Déploiement en production ──────────────────────────────
+      # Même commande que staging, mais avec "prod" comme environnement.
+      # Sur le serveur, deploy.sh utilise le tag latest-prod.
+      - name: Deploy
+        env:
+          SSH_VERBOSE: ${{ inputs.debug_ssh && '-vvv' || '' }}
+        run: ssh $SSH_VERBOSE oracle "deploy ${{ env.PROJECT_NAME }} prod ${{ github.sha }}"
+
+# =============================================================================
+# NOTES TECHNIQUES / PIÈGES
+# =============================================================================
+#
+# 1. DÉPENDANCES ENTRE JOBS
+#    needs: [build, deploy-staging] dans deploy-prod crée un graphe de
+#    dépendances. GitHub Actions les exécute dans l'ordre : build → staging → prod.
+#    Si build échoue, staging et prod sont skip. Si staging échoue, prod est skip.
+#    La garde "always()" force l'évaluation des conditions même si un job amont échoue.
+#
+# 2. ENVIRONNEMENTS GITHUB
+#    Les environments (staging, production) isolent les secrets. Vous pouvez
+#    avoir des ORACLE_HOST / ORACLE_SSH_KEY différents par environment :
+#    activez "Environment secrets" dans Settings → Environments.
+#    Le `environment: production` permet aussi un approver humain optionnel.
+#
+# 3. SSH GATE (CI-GATE.SH)
+#    La clé déployée sur le serveur est liée à une forced command dans
+#    authorized_keys : elle ne peut exécuter QUE `deploy <proj> <env> <sha>`
+#    (et rollback/status). Même si la clé fuit depuis GitHub, l'attaquant
+#    n'obtient pas de shell, juste les commandes listées.
+#    Le nom d'hôte ci-gate est à aligner avec cf. deploy.sh (setup ci_gate).
+#
+# 4. ROLLBACK
+#    Le rollback se fait côté serveur (git checkout + docker compose pull/up)
+#    OU en CI en repoussant un commit antérieur. Les tags par SHA permettent
+#    de référencer très précisément la version à restaurer :
+#      docker pull ${{ env.REGISTRY }}/my-app:aaaa...   # ancien SHA
+#      deploy my-app prod aaaa...
+#
+# 5. POLYGLOTTE / SUJET A SUIVRE
+#    - Le template est générique : adaptez environ() nombre de targets
+#      ou de jobs selon votre architecture (worker, cron, batch, test etape...)
+#    - Pour aller plus loin : job "test" intermédiaire entre build et deploy,
+#      ou sémantique de gate par environnement (approvals).
+#
+# 6. NOM DE FICHIER
+#    Le fichier doit être nommé deploy.yml et placé à la racine du repo dans
+#    .github/workflows/. Tout autre emplacement => GitHub l'ignore.
+#
+# 7. ACTIONS VERSIONS
+#    Pensez à mettre à jour régulièrement les versions des actions
+#    (actions/checkout@v4, docker/setup-buildx-action@v3,
+#     docker/login-action@v3, docker/build-push-action@v6) vers les dernières
+#    releases pour les corrections de sécurité et nouveaux runner images.
+# =============================================================================

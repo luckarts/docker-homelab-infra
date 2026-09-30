@@ -8,12 +8,16 @@ CONFIG_FILE="/etc/alertmanager/alertmanager.yml"
 TEMPLATE_FILE="/etc/alertmanager/alertmanager.template.yml"
 
 if [ -f "$TEMPLATE_FILE" ]; then
-  # Install envsubst if not available (gettext package)
-  if ! command -v envsubst >/dev/null 2>&1; then
-    apk add --no-cache gettext >/dev/null 2>&1
-  fi
+  # envsubst from gettext is unavailable in non-Alpine images,
+  # so substitute variables with a portable sed expression.
   echo "Substituting environment variables in Alertmanager config..."
-  envsubst < "$TEMPLATE_FILE" > "$CONFIG_FILE"
+  envsubst_portable() {
+    sed \
+      -e "s|\${ALERTMANAGER_SMTP_USERNAME}|${ALERTMANAGER_SMTP_USERNAME:-}|g" \
+      -e "s|\${ALERTMANAGER_SMTP_PASSWORD}|${ALERTMANAGER_SMTP_PASSWORD:-}|g" \
+      -e 's/\${[^}]*}//g' \
+  }
+  envsubst_portable < "$TEMPLATE_FILE" > "$CONFIG_FILE"
 fi
 
 exec alertmanager "$@"
